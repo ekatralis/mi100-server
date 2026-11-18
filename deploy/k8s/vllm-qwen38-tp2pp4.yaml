@@ -1,6 +1,7 @@
 # vLLM serving Qwen3.8-Flash-Next W4A16 on 8x MI100, recipe 1 from SERVING.md:
 # TP2 x PP4 + MTP2, 262K context, prefix caching on.
 #
+#   kubectl create secret generic vllm-api-key --from-literal=key="$(openssl rand -hex 32)"   # once
 #   kubectl apply -f deploy/k8s/vllm-qwen38-tp2pp4.yaml
 #   kubectl logs -f deploy/vllm-qwen38          # ready at "Application startup complete"
 #   kubectl port-forward svc/vllm-qwen38 8000:8000
@@ -76,6 +77,19 @@ spec:
               value: "14,14,15,5"
             - name: VLLM_PP_DECODE_BALANCE_MIN_REQS
               value: "2"
+            # Keep idle HTTP connections open (default 5 s). kubectl port-forward does not pass the server's close of
+            # an idle keep-alive connection on to the client, so a client that reuses it (opencode between turns)
+            # sends its request into a dead connection and hangs forever. 1 day: longer than any client keeps one.
+            - name: VLLM_HTTP_TIMEOUT_KEEP_ALIVE
+              value: "86400"
+            # API key (same as --api-key): every /v1/* request needs "Authorization: Bearer <key>". /health stays
+            # open, so the probes keep working. The key lives in a Secret, not in this file:
+            #   kubectl create secret generic vllm-api-key --from-literal=key="$(openssl rand -hex 32)"
+            - name: VLLM_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: vllm-api-key
+                  key: key
             # The cluster runs the pod as a non-root UID, which cannot enter /root (where the image puts HF_HOME).
             # Point every cache, and HOME, at the writable emptyDir mounted on /cache.
             - name: HOME
