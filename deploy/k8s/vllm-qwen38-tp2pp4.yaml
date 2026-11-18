@@ -1,5 +1,5 @@
 # vLLM serving Qwen3.8-Flash-Next W4A16 on 8x MI100, recipe 1 from SERVING.md:
-# TP2 x PP4 + MTP2, 262K context, prefix caching and TunableOp on.
+# TP2 x PP4 + MTP2, 262K context, prefix caching, TunableOp and 384 GiB CPU KV offload on.
 #
 #   kubectl create secret generic vllm-api-key --from-literal=key="$(openssl rand -hex 32)"   # once
 #   kubectl apply -f deploy/k8s/vllm-qwen38-tp2pp4.yaml
@@ -63,6 +63,10 @@ spec:
             # --enable-prompt-tokens-details reports cached tokens per request (usage.prompt_tokens_details).
             - --enable-prefix-caching
             - --enable-prompt-tokens-details
+            # CPU KV offload (GiB): needs the ERR-14 fix (image v0.0.3+). The region lives in /dev/shm (dshm volume
+            # below, sized to fit it) and counts against the pod's memory limit. Keep it <= 384 GiB: amdgpu driver
+            # pinned-memory cap on the MI100 node.
+            - --kv-offloading-size=384
             - --speculative-config={"method":"mtp","num_speculative_tokens":2,"use_local_argmax_reduction":true}
             - --reasoning-parser=qwen3
             - --tool-call-parser=qwen3_coder
@@ -151,11 +155,12 @@ spec:
             timeoutSeconds: 10
             failureThreshold: 5
       volumes:
-        # Replaces docker's --shm-size=64g / --ipc=host for the workers' shared memory.
+        # Replaces docker's --shm-size=64g / --ipc=host: the workers' shared memory (64 GiB, as with docker) plus the
+        # 384 GiB CPU KV offload region (--kv-offloading-size). The pod is evicted if this grows past sizeLimit.
         - name: dshm
           emptyDir:
             medium: Memory
-            sizeLimit: 128Gi
+            sizeLimit: 512Gi
         # HF weights plus vLLM / torch.compile / Triton caches (see env above), on the node's disk.
         # The pod is evicted if this grows past sizeLimit.
         - name: cache
