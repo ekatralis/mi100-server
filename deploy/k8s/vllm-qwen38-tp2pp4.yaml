@@ -1,5 +1,5 @@
 # vLLM serving Qwen3.8-Flash-Next W4A16 on 8x MI100, recipe 1 from SERVING.md:
-# TP2 x PP4 + MTP2, 262K context, prefix caching on.
+# TP2 x PP4 + MTP2, 262K context, prefix caching and TunableOp on.
 #
 #   kubectl create secret generic vllm-api-key --from-literal=key="$(openssl rand -hex 32)"   # once
 #   kubectl apply -f deploy/k8s/vllm-qwen38-tp2pp4.yaml
@@ -45,7 +45,7 @@ spec:
       containers:
         - name: vllm
           # TODO: pin the tag you pushed.
-          image: ghcr.io/ekatralis/vllm-mi100-cern:v0.0.2
+          image: ghcr.io/ekatralis/vllm-mi100-cern:v0.0.3
           imagePullPolicy: IfNotPresent
           command: ["vllm", "serve"]
           args:
@@ -77,6 +77,16 @@ spec:
               value: "14,14,15,5"
             - name: VLLM_PP_DECODE_BALANCE_MIN_REQS
               value: "2"
+            # PyTorch TunableOp: tuned dense-GEMM results for the TP2 x PP4 layout (one file per GPU, %d = device),
+            # shipped in the image under /opt/vllm/docker/ (mi100-qwen38 image built after the TunableOp commit).
+            # Read-only use (TUNING=0); untuned shapes fall back to the default kernels. +5-7% prefill.
+            # Valid only for the image's pinned torch/HIP/hipBLASLt/rocBLAS builds. Set ENABLED=0 to turn it off.
+            - name: PYTORCH_TUNABLEOP_ENABLED
+              value: "1"
+            - name: PYTORCH_TUNABLEOP_TUNING
+              value: "0"
+            - name: PYTORCH_TUNABLEOP_FILENAME
+              value: /opt/vllm/docker/tunableop-mi100-qwen38-tp2pp4/tunableop_results%d.csv
             # Keep idle HTTP connections open (default 5 s). kubectl port-forward does not pass the server's close of
             # an idle keep-alive connection on to the client, so a client that reuses it (opencode between turns)
             # sends its request into a dead connection and hangs forever. 1 day: longer than any client keeps one.
