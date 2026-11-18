@@ -1,0 +1,153 @@
+# vLLM serving Qwen3.8-Flash-Next W4A16 on 8x MI100, recipe 1 from SERVING.md:
+# TP2 x PP4 + MTP2, 262K context, prefix caching on.
+#
+#   kubectl apply -f deploy/k8s/vllm-qwen38-tp2pp4.yaml
+#   kubectl logs -f deploy/vllm-qwen38          # ready at "Application startup complete"
+#   kubectl port-forward svc/vllm-qwen38 8000:8000
+#   curl -s localhost:8000/v1/models
+#
+# The model (Intel/Qwen3.8-Flash-Next-W4A16-AutoRound, public, ~181 GB) is downloaded from Hugging Face into an
+# emptyDir on the node's disk. It survives container restarts within the pod (~5 min startup), but every new pod
+# (rollout, reschedule, delete) downloads it again.
+#
+# Before applying, check the TODOs: image tag and pull secret (if the GHCR package is private).
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vllm-qwen38
+  labels:
+    app: vllm-qwen38
+spec:
+  replicas: 1
+  # All 8 GPUs are held by one pod: the old pod must release them before the new one can schedule.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: vllm-qwen38
+  template:
+    metadata:
+      labels:
+        app: vllm-qwen38
+    spec:
+      nodeSelector:
+        amd.com/gpu.product-name: AMD_Radeon_PRO_MI100
+      # TODO: only needed if the GHCR package is private. Create it with:
+      #   kubectl create secret docker-registry ghcr-pull --docker-server=ghcr.io \
+      #     --docker-username=ekatralis --docker-password=<PAT with read:packages>
+      # imagePullSecrets:
+      #   - name: ghcr-pull
+      terminationGracePeriodSeconds: 60
+      # Don't inject VLLM_QWEN38_SERVICE_* env vars from the Service; vLLM warns about unknown VLLM_* variables.
+      enableServiceLinks: false
+      containers:
+        - name: vllm
+          # TODO: pin the tag you pushed.
+          image: ghcr.io/ekatralis/vllm-mi100-cern:v0.0.2
+          imagePullPolicy: IfNotPresent
+          command: ["vllm", "serve"]
+          args:
+            - Intel/Qwen3.8-Flash-Next-W4A16-AutoRound
+            - --served-model-name=qwen38-w4
+            - --tensor-parallel-size=2
+            - --pipeline-parallel-size=4
+            - --enable-expert-parallel
+            - --limit-mm-per-prompt={"image":0,"video":0}
+            - --max-model-len=262144
+            - --max-num-seqs=64
+            - --gpu-memory-utilization=0.94
+            # Prefix caching: validated for recipe 1 on mi100-qwen38 >= 98d7e120db (image v0.0.2+). Reuse is in
+            # 1,600-token blocks (mamba cache mode "align", chosen automatically for the linear-attention layers).
+            # --enable-prompt-tokens-details reports cached tokens per request (usage.prompt_tokens_details).
+            - --enable-prefix-caching
+            - --enable-prompt-tokens-details
+            - --speculative-config={"method":"mtp","num_speculative_tokens":2,"use_local_argmax_reduction":true}
+            - --reasoning-parser=qwen3
+            - --tool-call-parser=qwen3_coder
+            - --enable-auto-tool-choice
+            - --trust-remote-code
+            - --host=0.0.0.0
+            - --port=8000
+          env:
+            # PP-specific settings (SERVING.md recipe 1). The common environment
+            # (LD_LIBRARY_PATH, Inductor, hipcc bitcode, AITER off) is baked into the image.
+            - name: VLLM_PP_LAYER_PARTITION
+              value: "14,14,15,5"
+            - name: VLLM_PP_DECODE_BALANCE_MIN_REQS
+              value: "2"
+            # The cluster runs the pod as a non-root UID, which cannot enter /root (where the image puts HF_HOME).
+            # Point every cache, and HOME, at the writable emptyDir mounted on /cache.
+            - name: HOME
+              value: /cache
+            - name: XDG_CACHE_HOME # vLLM (VLLM_CACHE_ROOT defaults to $XDG_CACHE_HOME/vllm)
+              value: /cache
+            - name: HF_HOME
+              value: /cache/huggingface
+            - name: TRITON_CACHE_DIR
+              value: /cache/triton
+            - name: TORCHINDUCTOR_CACHE_DIR
+              value: /cache/torchinductor
+          ports:
+            - name: http
+              containerPort: 8000
+          # CPU and memory are assigned by the cluster (Kyverno validate-cpu-memory-resources); setting them is
+          # rejected. Note /dev/shm (below) is memory-backed and counts against the assigned memory limit.
+          # No securityContext: the cluster disallows SYS_PTRACE and seccomp=Unconfined (the docker run flags in
+          # Dockerfile.mi100). It also injects its own: a non-root UID and a Localhost seccomp profile.
+          resources:
+            requests:
+              amd.com/gpu: 8
+            limits:
+              amd.com/gpu: 8
+          volumeMounts:
+            - name: dshm
+              mountPath: /dev/shm
+            - name: cache
+              mountPath: /cache
+          # First start downloads ~181 GB before loading; allow up to 3 h before giving up.
+          # Later starts (weights cached) take ~5 min.
+          startupProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 10
+            failureThreshold: 1080
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 10
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 30
+            timeoutSeconds: 10
+            failureThreshold: 5
+      volumes:
+        # Replaces docker's --shm-size=64g / --ipc=host for the workers' shared memory.
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 128Gi
+        # HF weights plus vLLM / torch.compile / Triton caches (see env above), on the node's disk.
+        # The pod is evicted if this grows past sizeLimit.
+        - name: cache
+          emptyDir:
+            sizeLimit: 1Ti
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: vllm-qwen38
+  labels:
+    app: vllm-qwen38
+spec:
+  selector:
+    app: vllm-qwen38
+  ports:
+    - name: http
+      port: 8000
+      targetPort: http
