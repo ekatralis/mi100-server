@@ -1,5 +1,6 @@
-# vLLM serving Qwen3.8-Flash-Next W4A16 on 8x MI100, recipe 1 from SERVING.md:
-# TP2 x PP4 + MTP2, 262K context, prefix caching, TunableOp and 384 GiB CPU KV offload on.
+# vLLM serving Qwen3.8-Flash-Next W4A16 on 8x MI100, recipe 1 ("Config A") from SERVING.md:
+# TP2 x PP4 + MTP2, 262K context (no YaRN), prefix caching, TunableOp, image input (4 per prompt) and
+# 300 GiB CPU KV offload on. Same as `docker run -e QWEN38_IMAGES=1 ... serve-qwen38 tp2pp4 --kv-offloading-size 300`.
 #
 #   kubectl create secret generic vllm-api-key --from-literal=key="$(openssl rand -hex 32)"   # once
 #   kubectl apply -f deploy/k8s/vllm-qwen38-tp2pp4.yaml
@@ -44,8 +45,10 @@ spec:
       enableServiceLinks: false
       containers:
         - name: vllm
-          # TODO: pin the tag you pushed.
-          image: ghcr.io/ekatralis/vllm-mi100-cern:v0.0.3
+          # TODO: pin the tag you pushed. Needs an image built from the current Dockerfile.mi100 (release
+          # mi100-qwen38-v1.0: CPU offload fixes ERR-15/16, Triton ViT attention for images, ERR-17). Older images
+          # hang under load with offload on.
+          image: ghcr.io/ekatralis/vllm-mi100-cern:v1.0.0
           imagePullPolicy: IfNotPresent
           command: ["vllm", "serve"]
           args:
@@ -54,7 +57,13 @@ spec:
             - --tensor-parallel-size=2
             - --pipeline-parallel-size=4
             - --enable-expert-parallel
-            - --limit-mm-per-prompt={"image":0,"video":0}
+            # Image input: up to 4 images per prompt, video off. Triton ViT attention is required on MI100: the default
+            # (PyTorch SDPA) runs out of memory profiling the 16 MP maximum image at start-up (ERR-17). Costs ~3% of
+            # the GPU KV cache (3.53M instead of 3.70M tokens); text speed unchanged. The vision encoder is slow on
+            # MI100; to bound it, cap the image size, e.g.
+            #   --mm-processor-kwargs={"size":{"longest_edge":4194304,"shortest_edge":65536}}   (4 MP)
+            - --limit-mm-per-prompt={"image":4,"video":0}
+            - --mm-encoder-attn-backend=TRITON_ATTN
             - --max-model-len=262144
             - --max-num-seqs=64
             - --gpu-memory-utilization=0.94
@@ -63,10 +72,11 @@ spec:
             # --enable-prompt-tokens-details reports cached tokens per request (usage.prompt_tokens_details).
             - --enable-prefix-caching
             - --enable-prompt-tokens-details
-            # CPU KV offload (GiB): needs the ERR-14 fix (image v0.0.3+). The region lives in /dev/shm (dshm volume
-            # below, sized to fit it) and counts against the pod's memory limit. Keep it <= 384 GiB: amdgpu driver
-            # pinned-memory cap on the MI100 node.
-            - --kv-offloading-size=384
+            # CPU KV offload (GiB of host RAM, shared by all GPUs): needs the ERR-14/15/16 fixes (see image above).
+            # The buffers are driver-owned pinned memory and share the amdgpu TTM limit (503.6 GiB) with ~200 GiB of
+            # other pinned buffers on this model: 300 is the maximum for this recipe (~481 GiB in use); use 256 for
+            # more margin. Start-up refuses sizes that don't fit VLLM_ROCM_OFFLOAD_PINNED_RESERVE_GIB (env below).
+            - --kv-offloading-size=300
             - --speculative-config={"method":"mtp","num_speculative_tokens":2,"use_local_argmax_reduction":true}
             - --reasoning-parser=qwen3
             - --tool-call-parser=qwen3_coder
@@ -91,6 +101,14 @@ spec:
               value: "0"
             - name: PYTORCH_TUNABLEOP_FILENAME
               value: /opt/vllm/docker/tunableop-mi100-qwen38-tp2pp4/tunableop_results%d.csv
+            # CPU KV offload (as set by the image's serve-qwen38 launcher): host memory reserved for the model's other
+            # driver-owned pinned buffers (~200 GiB, ERR-15); start-up refuses an offload size that doesn't fit.
+            - name: VLLM_ROCM_OFFLOAD_PINNED_RESERVE_GIB
+              value: "190"
+            # Driver-owned pinned pages instead of kernel-movable userptr pages, which stalled the GPUs (ERR-15).
+            # vLLM sets this itself when offload is on; set here explicitly so it holds for every process.
+            - name: HSA_USERPTR_FOR_PAGED_MEM
+              value: "0"
             # Keep idle HTTP connections open (default 5 s). kubectl port-forward does not pass the server's close of
             # an idle keep-alive connection on to the client, so a client that reuses it (opencode between turns)
             # sends its request into a dead connection and hangs forever. 1 day: longer than any client keeps one.
@@ -155,8 +173,8 @@ spec:
             timeoutSeconds: 10
             failureThreshold: 5
       volumes:
-        # Replaces docker's --shm-size=64g / --ipc=host: the workers' shared memory (64 GiB, as with docker) plus the
-        # 384 GiB CPU KV offload region (--kv-offloading-size). The pod is evicted if this grows past sizeLimit.
+        # Replaces docker's --shm-size=64g / --ipc=host: the workers' shared memory (64 GiB, as with docker), with
+        # headroom for the CPU KV offload (--kv-offloading-size=300). The pod is evicted if this grows past sizeLimit.
         - name: dshm
           emptyDir:
             medium: Memory
