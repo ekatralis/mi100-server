@@ -48,7 +48,7 @@ spec:
           # TODO: pin the tag you pushed. Needs an image built from the current Dockerfile.mi100 (release
           # mi100-qwen38-v1.0: CPU offload fixes ERR-15/16, Triton ViT attention for images, ERR-17). Older images
           # hang under load with offload on.
-          image: ghcr.io/ekatralis/vllm-mi100-cern:v1.0.0
+          image: registry.cern.ch/ghcr.io/ekatralis/vllm-mi100-cern:v1.0.0
           imagePullPolicy: IfNotPresent
           command: ["vllm", "serve"]
           args:
@@ -117,11 +117,13 @@ spec:
             # API key (same as --api-key): every /v1/* request needs "Authorization: Bearer <key>". /health stays
             # open, so the probes keep working. The key lives in a Secret, not in this file:
             #   kubectl create secret generic vllm-api-key --from-literal=key="$(openssl rand -hex 32)"
-            - name: VLLM_API_KEY
-              valueFrom:
-                secretKeyRef:
-                  name: vllm-api-key
-                  key: key
+            # TODO: disabled temporarily so to test without a key: every /v1/* endpoint is open to anyone
+            # who can reach the Service. Re-enable before leaving it running.
+            # - name: VLLM_API_KEY
+            #   valueFrom:
+            #     secretKeyRef:
+            #       name: vllm-api-key
+            #       key: key
             # The cluster runs the pod as a non-root UID, which cannot enter /root (where the image puts HF_HOME).
             # Point every cache, and HOME, at the writable emptyDir mounted on /cache.
             - name: HOME
