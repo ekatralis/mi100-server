@@ -48,7 +48,7 @@ spec:
           # TODO: pin the tag you pushed. Needs an image built from the current Dockerfile.mi100 (release
           # mi100-qwen38-v1.0: CPU offload fixes ERR-15/16, Triton ViT attention for images, ERR-17). Older images
           # hang under load with offload on.
-          image: registry.cern.ch/ghcr.io/ekatralis/vllm-mi100-cern:v1.0.0
+          image: ghcr.io/ekatralis/vllm-mi100-cern:v1.0.0
           imagePullPolicy: IfNotPresent
           command: ["vllm", "serve"]
           args:
